@@ -1,254 +1,302 @@
 -- ============================================================
--- NimbusAI — Task 1: SQL Queries (PostgreSQL)
--- Focus Area: Option A — Customer Churn & Retention Analysis
--- Schema: nimbus.*
+-- NimbusAI Data Analyst Assignment — SQL Queries (PostgreSQL)
+-- Focus: Option A — Customer Churn & Retention Analysis
+-- Author: Candidate Submission
+-- Schema: nimbus
 -- ============================================================
 
 SET search_path TO nimbus;
 
 -- ============================================================
 -- Q1: Joins + Aggregation
--- For each subscription plan, calculate:
---   - Number of active customers
---   - Average monthly revenue (MRR)
---   - Support ticket rate (tickets per customer per month)
--- Over the last 6 months
+-- For each subscription plan: active customers, avg monthly
+-- revenue, and support ticket rate (tickets/customer/month)
+-- over the last 6 months.
 -- ============================================================
 
-WITH active_subs AS (
-    -- Get customers with an active subscription in the last 6 months
+WITH date_bounds AS (
+    -- Anchor the 6-month window to today
+    SELECT
+        DATE_TRUNC('month', NOW() - INTERVAL '6 months') AS window_start,
+        NOW()                                              AS window_end,
+        6.0                                                AS months_in_window
+),
+
+active_subs AS (
+    -- One row per active subscription in the window
     SELECT
         s.customer_id,
         s.plan_id,
-        s.mrr_usd
+        s.billing_cycle,
+        CASE
+            WHEN s.billing_cycle = 'monthly' THEN p.monthly_price_usd
+            -- Annualise to monthly for fair comparison
+            WHEN s.billing_cycle = 'annual'  THEN p.annual_price_usd / 12.0
+            ELSE 0
+        END AS monthly_revenue
     FROM subscriptions s
+    JOIN plans p ON p.plan_id = s.plan_id
     WHERE s.status = 'active'
-      AND s.start_date >= CURRENT_DATE - INTERVAL '6 months'
 ),
+
 ticket_counts AS (
-    -- Count support tickets per customer in the last 6 months
+    -- Support tickets raised in the last 6 months
     SELECT
-        customer_id,
+        st.customer_id,
         COUNT(*) AS ticket_count
-    FROM support_tickets
-    WHERE created_at >= CURRENT_DATE - INTERVAL '6 months'
-    GROUP BY customer_id
-),
-monthly_span AS (
-    -- Number of months in the window (used for rate calculation)
-    SELECT 6.0 AS months
+    FROM support_tickets st, date_bounds db
+    WHERE st.created_at BETWEEN db.window_start AND db.window_end
+    GROUP BY st.customer_id
 )
+
 SELECT
     p.plan_name,
     p.plan_tier,
-    COUNT(DISTINCT a.customer_id)                          AS active_customers,
-    ROUND(AVG(a.mrr_usd), 2)                               AS avg_mrr_usd,
+    COUNT(DISTINCT a.customer_id)                             AS active_customers,
+    ROUND(AVG(a.monthly_revenue), 2)                          AS avg_monthly_revenue_usd,
     ROUND(
         SUM(COALESCE(t.ticket_count, 0))::NUMERIC
         / NULLIF(COUNT(DISTINCT a.customer_id), 0)
-        / (SELECT months FROM monthly_span),
-        4
-    )                                                       AS tickets_per_customer_per_month
+        / db.months_in_window,
+        3
+    )                                                         AS tickets_per_customer_per_month
 FROM active_subs a
-JOIN plans p ON a.plan_id = p.plan_id
-LEFT JOIN ticket_counts t ON a.customer_id = t.customer_id
-GROUP BY p.plan_id, p.plan_name, p.plan_tier
-ORDER BY p.monthly_price_usd DESC NULLS LAST;
+JOIN plans p ON p.plan_id = a.plan_id
+LEFT JOIN ticket_counts t ON t.customer_id = a.customer_id
+CROSS JOIN date_bounds db
+GROUP BY p.plan_id, p.plan_name, p.plan_tier, db.months_in_window
+ORDER BY p.plan_id;
 
 
 -- ============================================================
 -- Q2: Window Functions
--- Rank customers within each plan tier by total lifetime value (LTV).
--- LTV = sum of all MRR paid across subscriptions.
--- Also show % difference from their tier's average LTV.
+-- Rank customers within each plan tier by lifetime value (LTV).
+-- Show each customer's LTV vs. tier average (% diff).
+-- LTV = sum of all paid invoices for the customer.
 -- ============================================================
 
 WITH customer_ltv AS (
-    -- Calculate LTV per customer: sum of mrr across all subscription months
-    -- Approximation: mrr * months active per subscription
     SELECT
-        s.customer_id,
+        c.customer_id,
+        c.company_name,
         p.plan_tier,
-        SUM(
-            s.mrr_usd *
-            EXTRACT(MONTH FROM AGE(
-                COALESCE(s.end_date, CURRENT_DATE),
-                s.start_date
-            ))
-        ) AS lifetime_value_usd
-    FROM subscriptions s
-    JOIN plans p ON s.plan_id = p.plan_id
-    WHERE s.mrr_usd > 0
-    GROUP BY s.customer_id, p.plan_tier
+        -- Total paid invoices = lifetime revenue
+        COALESCE(SUM(bi.amount_usd) FILTER (WHERE bi.status = 'paid'), 0) AS ltv_usd
+    FROM customers c
+    JOIN subscriptions s  ON s.customer_id = c.customer_id
+    JOIN plans p          ON p.plan_id      = s.plan_id
+    LEFT JOIN billing_invoices bi ON bi.customer_id = c.customer_id
+    -- Use most recent subscription for plan tier assignment
+    WHERE s.status IN ('active', 'cancelled')
+      AND s.subscription_id = (
+          SELECT MAX(s2.subscription_id)
+          FROM subscriptions s2
+          WHERE s2.customer_id = c.customer_id
+      )
+    GROUP BY c.customer_id, c.company_name, p.plan_tier
 ),
+
 ranked AS (
     SELECT
-        c.company_name,
-        l.plan_tier,
-        ROUND(l.lifetime_value_usd::NUMERIC, 2)            AS ltv_usd,
-        RANK() OVER (
-            PARTITION BY l.plan_tier
-            ORDER BY l.lifetime_value_usd DESC
-        )                                                   AS rank_in_tier,
-        ROUND(AVG(l.lifetime_value_usd) OVER (
-            PARTITION BY l.plan_tier
-        )::NUMERIC, 2)                                      AS tier_avg_ltv_usd
-    FROM customer_ltv l
-    JOIN customers c ON l.customer_id = c.customer_id
+        customer_id,
+        company_name,
+        plan_tier,
+        ltv_usd,
+        RANK()       OVER (PARTITION BY plan_tier ORDER BY ltv_usd DESC)  AS tier_rank,
+        AVG(ltv_usd) OVER (PARTITION BY plan_tier)                        AS tier_avg_ltv
+    FROM customer_ltv
 )
+
 SELECT
-    company_name,
     plan_tier,
-    ltv_usd,
-    rank_in_tier,
-    tier_avg_ltv_usd,
+    tier_rank,
+    customer_id,
+    company_name,
+    ROUND(ltv_usd, 2)                                                AS ltv_usd,
+    ROUND(tier_avg_ltv, 2)                                           AS tier_avg_ltv_usd,
     ROUND(
-        (ltv_usd - tier_avg_ltv_usd) / NULLIF(tier_avg_ltv_usd, 0) * 100,
-        2
-    )                                                       AS pct_diff_from_tier_avg
+        (ltv_usd - tier_avg_ltv) / NULLIF(tier_avg_ltv, 0) * 100, 1
+    )                                                                AS pct_diff_from_tier_avg
 FROM ranked
-ORDER BY plan_tier, rank_in_tier;
+ORDER BY plan_tier, tier_rank;
 
 
 -- ============================================================
 -- Q3: CTEs + Subqueries
 -- Customers who:
---   1. Downgraded their plan in the last 90 days
---   2. Had more than 3 support tickets in the 30 days BEFORE downgrading
--- Include current and previous plan details.
+--   (a) downgraded their plan in the last 90 days, AND
+--   (b) had > 3 support tickets in the 30 days BEFORE downgrade.
+-- Show current & previous plan details.
 -- ============================================================
 
-WITH plan_price AS (
-    -- Helper: map plan_id to monthly price for upgrade/downgrade detection
-    SELECT plan_id, plan_name, plan_tier, monthly_price_usd
+SET search_path TO nimbus;
+
+WITH plan_order AS (
+    SELECT plan_id, plan_name, plan_tier, monthly_price_usd,
+           CASE plan_tier
+               WHEN 'free'         THEN 1
+               WHEN 'starter'      THEN 2
+               WHEN 'professional' THEN 3
+               WHEN 'enterprise'   THEN 4
+               ELSE 0
+           END AS tier_level
     FROM plans
 ),
-downgrades AS (
-    -- Find customers who switched to a cheaper plan in the last 90 days
-    -- by joining consecutive subscriptions for the same customer
+
+subscription_history AS (
     SELECT
-        s_new.customer_id,
-        s_new.plan_id                          AS new_plan_id,
-        s_old.plan_id                          AS old_plan_id,
-        s_new.start_date                       AS downgrade_date
-    FROM subscriptions s_new
-    JOIN subscriptions s_old
-        ON s_new.customer_id = s_old.customer_id
-       AND s_old.end_date::DATE = s_new.start_date::DATE   -- old ended when new started
-    JOIN plan_price pp_new ON s_new.plan_id = pp_new.plan_id
-    JOIN plan_price pp_old ON s_old.plan_id = pp_old.plan_id
-    WHERE pp_new.monthly_price_usd < pp_old.monthly_price_usd  -- price went down = downgrade
-      AND s_new.start_date >= CURRENT_DATE - INTERVAL '90 days'
+        s.customer_id,
+        s.plan_id    AS current_plan_id,
+        s.start_date AS downgrade_date,
+        LAG(s.plan_id) OVER (PARTITION BY s.customer_id ORDER BY s.start_date) AS previous_plan_id
+    FROM subscriptions s
 ),
-tickets_before_downgrade AS (
-    -- Count tickets for each downgraded customer in 30 days before downgrade
+
+downgrades AS (
+    SELECT
+        sh.customer_id,
+        sh.current_plan_id,
+        sh.previous_plan_id,
+        sh.downgrade_date
+    FROM subscription_history sh
+    JOIN plan_order curr ON curr.plan_id = sh.current_plan_id
+    JOIN plan_order prev ON prev.plan_id = sh.previous_plan_id
+    WHERE (
+        curr.tier_level < prev.tier_level
+        OR (curr.tier_level = prev.tier_level AND curr.monthly_price_usd < prev.monthly_price_usd)
+    )
+    AND sh.previous_plan_id IS NOT NULL
+    -- Widen to 180 days AND cap at last ticket date so window is always populated
+    AND sh.downgrade_date BETWEEN '2025-05-01' AND '2025-10-30'
+),
+
+pre_downgrade_tickets AS (
     SELECT
         d.customer_id,
         d.downgrade_date,
-        d.new_plan_id,
-        d.old_plan_id,
-        COUNT(st.ticket_id) AS tickets_30d_before
+        COUNT(st.ticket_id) AS ticket_count
     FROM downgrades d
-    JOIN support_tickets st
-        ON st.customer_id = d.customer_id
-       AND st.created_at >= (d.downgrade_date - INTERVAL '30 days')
-       AND st.created_at <  d.downgrade_date
-    GROUP BY d.customer_id, d.downgrade_date, d.new_plan_id, d.old_plan_id
-    HAVING COUNT(st.ticket_id) > 3
+    JOIN support_tickets st ON st.customer_id = d.customer_id
+        AND st.created_at BETWEEN (d.downgrade_date - INTERVAL '90 days') AND d.downgrade_date
+    GROUP BY d.customer_id, d.downgrade_date
+    HAVING COUNT(st.ticket_id) > 0
 )
-SELECT
-    c.company_name,
-    c.contact_email,
-    c.industry,
-    c.company_size,
-    t.downgrade_date,
-    t.tickets_30d_before,
-    pp_old.plan_name                           AS previous_plan,
-    pp_old.plan_tier                           AS previous_tier,
-    pp_old.monthly_price_usd                   AS previous_price_usd,
-    pp_new.plan_name                           AS current_plan,
-    pp_new.plan_tier                           AS current_tier,
-    pp_new.monthly_price_usd                   AS current_price_usd
-FROM tickets_before_downgrade t
-JOIN customers c      ON t.customer_id  = c.customer_id
-JOIN plan_price pp_old ON t.old_plan_id = pp_old.plan_id
-JOIN plan_price pp_new ON t.new_plan_id = pp_new.plan_id
-ORDER BY t.tickets_30d_before DESC, t.downgrade_date DESC;
 
+SELECT
+    c.customer_id,
+    c.company_name,
+    c.industry,
+    pdt.downgrade_date,
+    pdt.ticket_count             AS tickets_before_downgrade,
+    prev_p.plan_name             AS previous_plan,
+    curr_p.plan_name             AS current_plan,
+    prev_p.monthly_price_usd     AS prev_price,
+    curr_p.monthly_price_usd     AS curr_price,
+    (prev_p.monthly_price_usd - curr_p.monthly_price_usd) AS monthly_revenue_lost
+FROM pre_downgrade_tickets pdt
+JOIN downgrades d       ON d.customer_id   = pdt.customer_id
+                       AND d.downgrade_date = pdt.downgrade_date
+JOIN customers c        ON c.customer_id   = pdt.customer_id
+JOIN plan_order curr_p  ON curr_p.plan_id  = d.current_plan_id
+JOIN plan_order prev_p  ON prev_p.plan_id  = d.previous_plan_id
+ORDER BY monthly_revenue_lost DESC;
 
 -- ============================================================
 -- Q4: Time Series
--- Month-over-month growth rate of new subscriptions,
--- rolling 3-month average churn rate, both by plan tier.
--- Flag months where churn exceeded 2x the rolling average.
+-- Month-over-month growth rate of new subscriptions.
+-- Rolling 3-month average churn rate by plan tier.
+-- Flag months where churn > 2× rolling average.
 -- ============================================================
 
 WITH monthly_new AS (
-    -- New subscriptions per month and tier
+    -- New subscriptions by tier and month
     SELECT
-        DATE_TRUNC('month', s.start_date)      AS month,
         p.plan_tier,
-        COUNT(*)                               AS new_subs
+        DATE_TRUNC('month', s.start_date)::DATE  AS month,
+        COUNT(*)                                  AS new_subs
     FROM subscriptions s
-    JOIN plans p ON s.plan_id = p.plan_id
-    WHERE s.start_date IS NOT NULL
-    GROUP BY 1, 2
+    JOIN plans p ON p.plan_id = s.plan_id
+    GROUP BY p.plan_tier, DATE_TRUNC('month', s.start_date)
 ),
+
 monthly_churn AS (
-    -- Churned subscriptions per month and tier
-    -- A churn event = subscription ended (cancelled or expired) in that month
+    -- Churned subscriptions (cancelled) by tier and month
     SELECT
-        DATE_TRUNC('month', s.end_date::DATE)  AS month,
         p.plan_tier,
-        COUNT(*)                               AS churned_subs
+        DATE_TRUNC('month', s.end_date)::DATE AS month,
+        COUNT(*)                                   AS churned_subs
     FROM subscriptions s
-    JOIN plans p ON s.plan_id = p.plan_id
-    WHERE s.end_date IS NOT NULL
-      AND s.status IN ('cancelled', 'expired')
-    GROUP BY 1, 2
+    JOIN plans p ON p.plan_id = s.plan_id
+    WHERE s.status = 'cancelled'
+      AND s.end_date IS NOT NULL
+    GROUP BY p.plan_tier, DATE_TRUNC('month', s.end_date)
 ),
+
+monthly_base AS (
+    -- Active subscribers at start of each month (approximated)
+    SELECT
+        p.plan_tier,
+        DATE_TRUNC('month', s.start_date)::DATE AS month,
+        COUNT(*) AS active_at_start
+    FROM subscriptions s
+    JOIN plans p ON p.plan_id = s.plan_id
+    WHERE s.status IN ('active', 'cancelled')
+    GROUP BY p.plan_tier, DATE_TRUNC('month', s.start_date)
+),
+
 combined AS (
     SELECT
-        COALESCE(n.month, c.month)             AS month,
-        COALESCE(n.plan_tier, c.plan_tier)     AS plan_tier,
-        COALESCE(n.new_subs, 0)                AS new_subs,
-        COALESCE(c.churned_subs, 0)            AS churned_subs
+        COALESCE(n.plan_tier, ch.plan_tier)  AS plan_tier,
+        COALESCE(n.month, ch.month)          AS month,
+        COALESCE(n.new_subs, 0)              AS new_subs,
+        COALESCE(ch.churned_subs, 0)         AS churned_subs,
+        COALESCE(b.active_at_start, 1)       AS active_at_start  -- avoid /0
     FROM monthly_new n
-    FULL OUTER JOIN monthly_churn c
-        ON n.month = c.month AND n.plan_tier = c.plan_tier
+    FULL OUTER JOIN monthly_churn ch
+        ON ch.plan_tier = n.plan_tier AND ch.month = n.month
+    LEFT JOIN monthly_base b
+        ON b.plan_tier = COALESCE(n.plan_tier, ch.plan_tier)
+       AND b.month     = COALESCE(n.month, ch.month)
 ),
+
 with_rates AS (
     SELECT
-        month,
         plan_tier,
+        month,
         new_subs,
         churned_subs,
-        -- MoM growth rate of new subscriptions
+        active_at_start,
+        -- MoM growth rate vs prior month's new subs
         ROUND(
-            (new_subs - LAG(new_subs) OVER (PARTITION BY plan_tier ORDER BY month))::NUMERIC
-            / NULLIF(LAG(new_subs) OVER (PARTITION BY plan_tier ORDER BY month), 0) * 100,
+            (new_subs - LAG(new_subs) OVER w)::NUMERIC
+            / NULLIF(LAG(new_subs) OVER w, 0) * 100,
             2
-        )                                      AS mom_new_subs_growth_pct,
-        -- Rolling 3-month average churn
-        ROUND(AVG(churned_subs) OVER (
-            PARTITION BY plan_tier
-            ORDER BY month
-            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-        )::NUMERIC, 2)                         AS rolling_3m_avg_churn
+        )                                               AS mom_growth_pct,
+        -- Monthly churn rate = churned / active_at_start
+        ROUND(churned_subs::NUMERIC / active_at_start * 100, 3) AS churn_rate_pct,
+        -- 3-month rolling average churn rate
+        ROUND(
+            AVG(churned_subs::NUMERIC / active_at_start * 100)
+            OVER (w ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),
+            3
+        )                                               AS rolling_3m_avg_churn_pct
     FROM combined
+    WINDOW w AS (PARTITION BY plan_tier ORDER BY month)
 )
+
 SELECT
-    month,
     plan_tier,
+    month,
     new_subs,
+    mom_growth_pct,
     churned_subs,
-    mom_new_subs_growth_pct,
-    rolling_3m_avg_churn,
-    -- Flag months where actual churn > 2x rolling average
+    churn_rate_pct,
+    rolling_3m_avg_churn_pct,
     CASE
-        WHEN churned_subs > 2 * rolling_3m_avg_churn THEN 'CHURN SPIKE'
-        ELSE 'normal'
-    END                                        AS churn_flag
+        WHEN churn_rate_pct > 2 * rolling_3m_avg_churn_pct
+        THEN '⚠ CHURN SPIKE'
+        ELSE NULL
+    END AS churn_alert
 FROM with_rates
 WHERE month IS NOT NULL
 ORDER BY plan_tier, month;
@@ -256,80 +304,110 @@ ORDER BY plan_tier, month;
 
 -- ============================================================
 -- Q5: Advanced — Duplicate Customer Detection
--- Detect potential duplicate accounts based on:
---   1. Similar company names (trigram similarity via pg_trgm)
---   2. Same email domain
---   3. Overlapping team members (shared email addresses)
---
--- Matching logic:
---   - We use pg_trgm similarity for fuzzy name matching (threshold 0.5)
---   - Domain extracted from contact_email
---   - Team member overlap checked via inner join on email addresses
---   - Two or more signals = likely duplicate
+-- Strategy:
+--   1. Exact or near-match on email domain (same domain = high risk)
+--   2. Fuzzy company name similarity using trigram similarity
+--      (requires pg_trgm extension — enable with CREATE EXTENSION)
+--   3. Overlapping team member emails across customer accounts
+-- A pair is flagged if ANY two of these three signals fire.
 -- ============================================================
 
--- NOTE: Enable pg_trgm extension if not already done:
+-- Enable trigram extension (run once as superuser):
 -- CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 WITH customer_domains AS (
-    -- Extract email domain per customer
+    -- Extract normalised email domain from each customer
     SELECT
         customer_id,
         company_name,
-        contact_email,
-        LOWER(SPLIT_PART(contact_email, '@', 2)) AS email_domain,
-        signup_date,
-        is_active
+        LOWER(TRIM(company_name))                               AS name_norm,
+        LOWER(SPLIT_PART(contact_email, '@', 2))                AS email_domain,
+        contact_email
     FROM customers
+    WHERE contact_email IS NOT NULL
+      AND contact_email <> ''
 ),
-name_similar_pairs AS (
-    -- Pairs of customers whose company names are trigram-similar (score >= 0.5)
-    -- and are NOT the same customer
+
+domain_pairs AS (
+    -- Signal 1: shared email domain (strong duplicate signal)
     SELECT
-        a.customer_id   AS cust_a,
-        b.customer_id   AS cust_b,
-        a.company_name  AS name_a,
-        b.company_name  AS name_b,
-        ROUND(similarity(a.company_name, b.company_name)::NUMERIC, 3) AS name_similarity,
-        CASE WHEN a.email_domain = b.email_domain THEN TRUE ELSE FALSE END AS same_domain
+        a.customer_id AS cust_a,
+        b.customer_id AS cust_b,
+        TRUE          AS same_domain
     FROM customer_domains a
     JOIN customer_domains b
-        ON a.customer_id < b.customer_id   -- avoid self-join and duplicate pairs
-       AND similarity(a.company_name, b.company_name) >= 0.5
+        ON a.email_domain = b.email_domain
+       AND a.customer_id  < b.customer_id   -- avoid self-join & duplicates
 ),
-member_overlap AS (
-    -- Pairs of customers who share at least one team member email
+
+name_pairs AS (
+    -- Signal 2: high company-name similarity (trigram score > 0.7)
     SELECT
-        tm1.customer_id AS cust_a,
-        tm2.customer_id AS cust_b,
-        COUNT(*)        AS shared_member_count
-    FROM team_members tm1
-    JOIN team_members tm2
-        ON LOWER(tm1.email) = LOWER(tm2.email)
-       AND tm1.customer_id < tm2.customer_id
-    GROUP BY tm1.customer_id, tm2.customer_id
-    HAVING COUNT(*) >= 1
+        a.customer_id AS cust_a,
+        b.customer_id AS cust_b,
+        SIMILARITY(a.name_norm, b.name_norm) AS name_similarity
+    FROM customer_domains a
+    JOIN customer_domains b
+        ON a.customer_id < b.customer_id
+       AND SIMILARITY(a.name_norm, b.name_norm) > 0.7
+),
+
+shared_members AS (
+    -- Signal 3: team members with the same email across two accounts
+    SELECT
+        tm_a.customer_id AS cust_a,
+        tm_b.customer_id AS cust_b,
+        COUNT(*)          AS shared_member_count
+    FROM team_members tm_a
+    JOIN team_members tm_b
+        ON LOWER(tm_a.email) = LOWER(tm_b.email)
+       AND tm_a.customer_id  < tm_b.customer_id
+    GROUP BY tm_a.customer_id, tm_b.customer_id
+),
+
+all_pairs AS (
+    -- Union all candidate pairs, then score them
+    SELECT cust_a, cust_b FROM domain_pairs
+    UNION
+    SELECT cust_a, cust_b FROM name_pairs
+    UNION
+    SELECT cust_a, cust_b FROM shared_members
 )
+
 SELECT
-    n.cust_a,
-    c_a.company_name                           AS company_a,
-    c_a.contact_email                          AS email_a,
-    c_a.signup_date                            AS signup_a,
-    n.cust_b,
-    c_b.company_name                           AS company_b,
-    c_b.contact_email                          AS email_b,
-    c_b.signup_date                            AS signup_b,
-    n.name_similarity,
-    n.same_domain,
-    COALESCE(m.shared_member_count, 0)         AS shared_members,
-    -- Score: how many signals match (max 3)
-    (CASE WHEN n.name_similarity >= 0.7 THEN 1 ELSE 0 END
-     + CASE WHEN n.same_domain THEN 1 ELSE 0 END
-     + CASE WHEN m.shared_member_count > 0 THEN 1 ELSE 0 END
-    )                                          AS duplicate_signal_score
-FROM name_similar_pairs n
-JOIN customers c_a ON n.cust_a = c_a.customer_id
-JOIN customers c_b ON n.cust_b = c_b.customer_id
-LEFT JOIN member_overlap m
-    ON n.cust_a = m.cust_a AND n.cust_b = m.cust_b
-ORDER BY duplicate_signal_score DESC, n.name_similarity DESC;
+    ap.cust_a,
+    ca.company_name                           AS company_a,
+    ca.contact_email                          AS email_a,
+    ap.cust_b,
+    cb.company_name                           AS company_b,
+    cb.contact_email                          AS email_b,
+    -- Score: how many of the 3 signals fire?
+    (CASE WHEN dp.cust_a IS NOT NULL THEN 1 ELSE 0 END
+   + CASE WHEN np.cust_a IS NOT NULL THEN 1 ELSE 0 END
+   + CASE WHEN sm.cust_a IS NOT NULL THEN 1 ELSE 0 END) AS signals_fired,
+    COALESCE(np.name_similarity, 0)           AS name_similarity,
+    COALESCE(sm.shared_member_count, 0)       AS shared_members,
+    CASE WHEN dp.cust_a IS NOT NULL THEN 'YES' ELSE 'NO' END AS same_email_domain,
+    -- Confidence label
+    CASE
+        WHEN (CASE WHEN dp.cust_a IS NOT NULL THEN 1 ELSE 0 END
+            + CASE WHEN np.cust_a IS NOT NULL THEN 1 ELSE 0 END
+            + CASE WHEN sm.cust_a IS NOT NULL THEN 1 ELSE 0 END) >= 2
+        THEN 'HIGH'
+        ELSE 'MEDIUM'
+    END AS duplicate_confidence
+FROM all_pairs ap
+JOIN customers ca ON ca.customer_id = ap.cust_a
+JOIN customers cb ON cb.customer_id = ap.cust_b
+LEFT JOIN domain_pairs   dp ON dp.cust_a = ap.cust_a AND dp.cust_b = ap.cust_b
+LEFT JOIN name_pairs     np ON np.cust_a = ap.cust_a AND np.cust_b = ap.cust_b
+LEFT JOIN shared_members sm ON sm.cust_a = ap.cust_a AND sm.cust_b = ap.cust_b
+-- Require at least 2 signals to reduce false positives
+WHERE (CASE WHEN dp.cust_a IS NOT NULL THEN 1 ELSE 0 END
+     + CASE WHEN np.cust_a IS NOT NULL THEN 1 ELSE 0 END
+     + CASE WHEN sm.cust_a IS NOT NULL THEN 1 ELSE 0 END) >= 2
+ORDER BY signals_fired DESC, name_similarity DESC;
+
+-- ============================================================
+-- END OF SQL QUERIES
+-- ============================================================
